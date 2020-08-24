@@ -1,0 +1,1039 @@
+- hosts: all
+  gather_facts: no
+  remote_user: root
+  vars:
+    hosts: "{{ groups['all'] | map('extract', hostvars, ['ansible_host']) | list }}"
+    names: "{{ groups['all'] }}"
+  tasks:
+    - name: Disable swap & selinux
+      shell: "{{ item }}"
+      with_items:
+        - swapoff -a || true
+        - setenforce 0 || true
+        - sed -i /^[^#]*swap*/s/^/\#/g /etc/fstab
+        - sed -i 's/=enforcing/=disabled/g' /etc/selinux/config
+    - name: Disable firewall & postfix services
+      service: "name={{ item }} state=stopped enabled=no"
+      with_items:
+        - firewalld
+        - postfix
+    - name: Enable IPVS Module
+      shell: |
+        modprobe ip_vs_rr
+        modprobe br_netfilter
+        modprobe -- ip_vs
+        modprobe -- ip_vs_rr
+        modprobe -- ip_vs_wrr
+        modprobe -- ip_vs_sh
+        if [[ $(uname -r |cut -d . -f1) -ge 4 ]]; then
+          modprobe -- nf_conntrack
+        else
+          modprobe -- nf_conntrack_ipv4
+        fi
+    - name: Setup Hosts
+      shell:
+        cmd: |
+          cat <<EOF > /etc/hosts
+          127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4
+          ::1         localhost localhost.localdomain localhost6 localhost6.localdomain6
+          {% for i in range (0, names | count) %}
+          {{ hosts[i] }} {{ names[i] }}
+          {% endfor %}
+          EOF
+    - name: Setup hostname
+      command: hostnamectl set-hostname {{ inventory_hostname }}
+    - name: Install epel-release
+      yum: name=epel-release state=installed
+    - name: Install basic tool package
+      yum:
+        state: installed
+        name:
+          - nc
+          - nmap
+          - telnet
+          - iftop
+          - iotop
+          - qperf
+          - traceroute
+          - sysstat
+          - lsof
+          - ntpdate
+          - ntp
+          - ipvsadm
+          - ipset
+          - git
+          - wget
+          - curl
+          - unzip
+          - psmisc
+          - systemd
+          - rsync
+          - python3
+          - yum-utils
+          - device-mapper-persistent-data
+          - lvm2
+    - name: Setting timezone
+      command: "{{ item }}"
+      with_items:
+        - timedatectl set-timezone Asia/Shanghai
+        - timedatectl set-local-rtc 0
+    - name: Restart rsyslog & crond service
+      service: "name={{ item }} state=restarted"
+      with_items:
+        - rsyslog
+        - crond
+    - name: Add Docker Repository Info
+      shell: "{{ item }}"
+      with_items:
+        - yum-config-manager --add-repo http://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo
+        - yum makecache fast
+    - name: Install Docker Service
+      yum: name=docker-ce state=installed
+    - name: Create Docker Config Directory
+      file: path=/etc/docker state=directory
+    - name: Setting Docker Config
+      shell:
+        cmd: |
+          cat <<EOF > /etc/docker/daemon.json
+          {
+            "registry-mirrors": ["https://91abmaa0.mirror.aliyuncs.com"],
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "2m",
+              "max-file": "5"
+            },
+            "exec-opts": ["native.cgroupdriver=systemd"],
+            "storage-driver": "overlay2",
+            "storage-opts": [
+              "overlay2.override_kernel_check=true"
+            ]
+          }
+          EOF
+    - name: Start Docker Service
+      systemd: name=docker state=started daemon_reload=yes enabled=yes
+    - name: Setting limits Config
+      shell:
+        cmd: |
+          cat <<EOF > /etc/security/limits.conf
+          * soft nproc 65536
+          * hard nproc 65536
+          * soft nofile 102400
+          * hard nofile 102400
+          * soft memlock unlimited
+          * hard memlock unlimited
+          EOF
+    - name: Setting Sysctl Config
+      shell:
+        cmd: |
+          cat <<EOF > /etc/sysctl.conf
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+          fs.inotify.max_user_instances = 524288
+          fs.inotify.max_user_watches = 524288
+          vm.swappiness = 0
+          fs.file-max = 52706963
+          fs.nr_open = 52706963
+          net.ipv4.tcp_keepalive_time = 600
+          net.ipv4.tcp_keepalive_intvl = 30
+          net.ipv4.tcp_keepalive_probes = 10
+          net.core.somaxconn=65535
+          net.core.netdev_max_backlog=10000
+          net.netfilter.nf_conntrack_max=10485760
+          net.netfilter.nf_conntrack_tcp_timeout_established=300
+          net.ipv4.tcp_max_tw_buckets = 18000
+          net.ipv4.tcp_fin_timeout = 30
+          net.ipv4.tcp_syncookies = 1
+          net.ipv4.tcp_tw_reuse = 1
+          net.ipv4.tcp_tw_recycle = 1
+          net.ipv4.tcp_no_metrics_save = 1
+          net.unix.max_dgram_qlen = 1024
+          EOF
+    - name: Refresh Sysctl
+      shell: "{{ item }}"
+      with_items:
+        - sysctl -p
+        - echo 262144 | tee /sys/module/nf_conntrack/parameters/hashsize
+    - name: Setting K8s Resitory
+      shell:
+        cmd: |
+          cat <<EOF > /etc/yum.repos.d/kubernetes.repo
+          [kubernetes]
+          name=Kubernetes
+          baseurl=https://mirrors.aliyun.com/kubernetes/yum/repos/kubernetes-el7-x86_64
+          enabled=1
+          gpgcheck=1
+          repo_gpgcheck=1
+          gpgkey=https://mirrors.aliyun.com/kubernetes/yum/doc/yum-key.gpg https://mirrors.aliyun.com/kubernetes/yum/doc/rpm-package-key.gpg
+          EOF
+    - name: Setup K8s
+      command: yum install -y kubelet-{{ version }} kubeadm-{{ version }} kubectl-{{ version }}
+    - name: Setting K8s Args
+      shell:
+        cmd: |
+          cat >/etc/sysconfig/kubelet<<EOF
+          KUBELET_EXTRA_ARGS="--pod-infra-container-image=registry.aliyuncs.com/google_containers/pause-amd64:3.2"
+          EOF
+    - name: Create Kubelet Service Directory
+      file: path=/etc/systemd/system/kubelet.service.d state=directory
+    - name: Setting K8s Service
+      shell:
+        cmd: |
+          cat > /etc/systemd/system/kubelet.service.d/10-kubeadm.conf <<EOF
+          # Note: This dropin only works with kubeadm and kubelet v1.11+
+          [Service]
+          Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+          Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml --cgroup-driver=systemd"
+          # This is a file that "kubeadm init" and "kubeadm join" generates at runtime, populating the KUBELET_KUBEADM_ARGS variable dynamically
+          EnvironmentFile=-/var/lib/kubelet/kubeadm-flags.env
+          # This is a file that the user can use for overrides of the kubelet args as a last resort. Preferably, the user should use
+          # the .NodeRegistration.KubeletExtraArgs object in the configuration files instead. KUBELET_EXTRA_ARGS should be sourced from this file.
+          EnvironmentFile=-/etc/sysconfig/kubelet
+          ExecStart=
+          ExecStart=/usr/bin/kubelet \$KUBELET_KUBECONFIG_ARGS \$KUBELET_CONFIG_ARGS \$KUBELET_KUBEADM_ARGS \$KUBELET_EXTRA_ARGS
+          EOF
+    - name: Start Kubelet Service
+      systemd: name=kubelet state=started daemon_reload=yes enabled=yes
+
+- hosts: etcd
+  gather_facts: no
+  tasks:
+    - name: Remove Etcd SSL Directory
+      file: path=/etc/etcd/ssl state=absent
+    - name: Remove Etcd Data Directory
+      file: path=/var/lib/etcd state=absent
+    - name: Create Etcd Config Directory
+      file: path=/etc/etcd/ssl state=directory
+    - name: Create Etcd Data Directory
+      file: path=/var/lib/etcd state=directory
+
+- hosts: etcd[0]
+  gather_facts: no
+  vars:
+    hosts: "{{ groups['etcd'] | map('extract', hostvars, ['ansible_host']) | list }}"
+    names: "{{ groups['etcd'] }}"
+  tasks:
+    - name: Create SSL directory
+      file: path=ssl state=directory
+    - name: Download cfssl tool
+      get_url:
+        url: https://pkg.cfssl.org/R1.2/cfssl_linux-amd64
+        dest: /usr/bin/cfssl
+        mode: '0755'
+    - name: Download cfssljson tool
+      get_url:
+        url: https://pkg.cfssl.org/R1.2/cfssljson_linux-amd64
+        dest: /usr/bin/cfssljson
+        mode: '0755'
+    - name: Download cfssl-certinfo tool
+      get_url:
+        url: https://pkg.cfssl.org/R1.2/cfssl-certinfo_linux-amd64
+        dest: /usr/bin/cfssl-certinfo
+        mode: '0755'
+    - name: SSL CA Configuration
+      shell:
+        cmd: |
+          cat <<EOF > ssl/ca-config.json
+          {
+            "signing": {
+              "default": {
+                "expiry": "87600h"
+              },
+              "profiles": {
+                "kubernetes-Soulmate": {
+                  "usages": [
+                    "signing",
+                    "key encipherment",
+                    "server auth",
+                    "client auth"
+                  ],
+                  "expiry": "87600h"
+                }
+              }
+            }
+          }
+          EOF
+    - name: SSL CSR Configuration
+      shell:
+        cmd: |
+          cat <<EOF > ssl/ca-csr.json
+          {
+            "CN": "kubernetes-Soulmate",
+            "key": {
+              "algo": "rsa",
+              "size": 2048
+            },
+            "names": [{
+              "C": "CN",
+              "ST": "wuxi",
+              "L": "wuxi",
+              "O": "k8s",
+              "OU": "System"
+            }]
+          }
+          EOF
+    - name: SSL Etcd Configuration
+      shell:
+        cmd: |
+          cat <<EOF > ssl/etcd-csr.json
+          {
+            "CN": "etcd",
+            "hosts": [
+              "127.0.0.1",
+          {% for i in range (0, hosts | count) %}
+              "{{ hosts[i] }}"{% if i != (hosts | count) - 1 %},{% endif %}
+          {% endfor %}
+            ],
+            "key": {
+              "algo": "rsa",
+              "size": 2048
+            },
+            "names": [
+              {
+                "C": "CN",
+                "ST": "wuxi",
+                "L": "wuxi",
+                "O": "k8s",
+                "OU": "System"
+              }
+            ]
+          }
+          EOF
+    - name: Generate a certificate
+      shell: "{{ item }}"
+      with_items:
+        - cd ssl && cfssl gencert -initca ca-csr.json | cfssljson -bare ca
+        - cd ssl && cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=kubernetes-Soulmate etcd-csr.json | cfssljson -bare etcd
+    - name: Copy Etcd Config files
+      shell: cd ssl && cp etcd.pem etcd-key.pem ca.pem /etc/etcd/ssl/
+    - name: Remove SSL Directory
+      file: path=ssl state=absent
+
+- hosts: etcd
+  gather_facts: no
+  vars:
+    ansible_python_interpreter: "/usr/bin/python3"
+    copy_node: "{{ groups['etcd'][0] }}"
+  tasks:
+    - name: Create Etcd Config Directory
+      file: path=/etc/etcd/ssl state=directory
+    - name: Copy Etcd Config Directory
+      synchronize: src=/etc/etcd/ssl/ dest=/etc/etcd/ssl/
+      delegate_to: "{{ copy_node }}"
+      when: inventory_hostname != copy_node
+
+- hosts: k8smaster
+  gather_facts: no
+  vars:
+    ansible_python_interpreter: "/usr/bin/python3"
+    copy_node: "{{ groups['etcd'][0] }}"
+  tasks:
+    - name: Create Etcd Config Directory
+      file: path=/etc/etcd/ssl state=directory
+    - name: Copy Etcd Config Directory
+      synchronize: src=/etc/etcd/ssl/ dest=/etc/etcd/ssl/
+      delegate_to: "{{ copy_node }}"
+      when: inventory_hostname != copy_node
+
+- hosts: etcd
+  gather_facts: no
+  remote_user: root
+  vars:
+    hosts: "{{ groups['etcd'] | map('extract', hostvars, ['ansible_host']) | list }}"
+    names: "{{ groups['etcd'] }}"
+    etcd_cluster: "{% for i in range (0, names | count) %}{{ names[i] }}=https://{{ hosts[i] }}:2380{% if i != (names | count) - 1 %},{% endif %}{% endfor %}"
+    endpoints: "{{['https://'] | product((groups['etcd'] | map('extract', hostvars, ['ansible_host']) | list)) | map('join', '') | join(':2379,') }}:2379"
+  tasks:
+    - name: Install Etcd Service
+      yum: name=etcd state=installed
+    - name: Configuration Etcd Service
+      shell:
+        cmd: |
+          cat <<EOF > /etc/systemd/system/etcd.service
+          [Unit]
+          Description=Etcd Server
+          After=network.target
+          After=network-online.target
+          Wants=network-online.target
+          Documentation=https://github.com/coreos
+
+          [Service]
+          Type=notify
+          WorkingDirectory=/var/lib/etcd/
+          ExecStart=/usr/bin/etcd \
+          --name {{ inventory_hostname }} \
+          --cert-file=/etc/etcd/ssl/etcd.pem \
+          --key-file=/etc/etcd/ssl/etcd-key.pem \
+          --peer-cert-file=/etc/etcd/ssl/etcd.pem \
+          --peer-key-file=/etc/etcd/ssl/etcd-key.pem \
+          --trusted-ca-file=/etc/etcd/ssl/ca.pem \
+          --peer-trusted-ca-file=/etc/etcd/ssl/ca.pem \
+          --initial-advertise-peer-urls https://{{ ansible_host }}:2380 \
+          --listen-peer-urls https://{{ ansible_host }}:2380 \
+          --listen-client-urls https://{{ ansible_host }}:2379,http://127.0.0.1:2379 \
+          --advertise-client-urls https://{{ ansible_host }}:2379 \
+          --initial-cluster-token etcd-huaplus \
+          --initial-cluster {{ etcd_cluster }} \
+          --initial-cluster-state new \
+          --data-dir=/var/lib/etcd \
+          --max-request-bytes '10485760' \
+          --quota-backend-bytes '8589934592'
+          Restart=on-failure
+          RestartSec=5
+          LimitNOFILE=65536
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+    - name: Start Etcd Service
+      systemd: name=etcd state=started daemon_reload=yes enabled=yes
+    - name: Check Etcd Service Health
+      command: etcdctl --endpoints={{ endpoints }}  --ca-file=/etc/etcd/ssl/ca.pem --cert-file=/etc/etcd/ssl/etcd.pem --key-file=/etc/etcd/ssl/etcd-key.pem cluster-health
+
+- hosts: k8smaster
+  gather_facts: no
+  remote_user: root
+  vars:
+    hosts: "{{ groups['k8smaster'] | map('extract', hostvars, ['ansible_host']) | list }}"
+    names: "{{ groups['k8smaster'] }}"
+    peer: "{{ hosts | reject('search', ansible_host) | list }}"
+  tasks:
+    - name: Install Haproxy Service
+      yum: name=haproxy state=installed
+      when: names | count > 1
+    - name: Configuration Haproxy
+      shell:
+        cmd: |
+          cat > /etc/haproxy/haproxy.cfg <<EOF
+          global
+                log /dev/log    local0
+                log /dev/log    local1 notice
+                chroot /var/lib/haproxy
+                stats socket /run/haproxy.sock mode 660 level admin
+                stats timeout 30s
+                user haproxy
+                group haproxy
+                daemon
+                nbproc 1
+
+          defaults
+                log     global
+                timeout connect 5000
+                timeout client  10m
+                timeout server  10m
+
+          listen kube-master
+                bind 0.0.0.0:8443
+                mode tcp
+                option tcplog
+                balance roundrobin
+          {% for host in hosts %}
+                server {{ host }} {{ host }}:6443 check inter 2000 fall 2 rise 2 weight 1
+          {% endfor %}
+          EOF
+      when: names | count > 1
+    - name: Start Haproxy Service
+      systemd: name=haproxy state=started daemon_reload=yes enabled=yes
+      when: names | count > 1
+    - name: Install Keepalived Service
+      yum: name=keepalived state=installed
+      when: names | count > 1
+    - name: Configuration Keepalived Service
+      shell:
+        cmd: |
+          cat <<EOF > /etc/keepalived/keepalived.conf
+          global_defs {
+            router_id lb-master-{{ ansible_host }}
+            script_user root
+            enable_script_security
+          }
+          vrrp_script check-haproxy {
+            script "/usr/bin/killall -0 haproxy"
+            interval 5
+            timeout 5
+            fall 2
+            rise 2
+          }
+          vrrp_instance VI-kube-master {
+            state {{ state }}
+            priority {{ level }}
+            unicast_src_ip {{ ansible_host }}
+            unicast_peer {
+          {% for item in peer %}
+              {{ item }}
+          {% endfor %}
+            }
+            dont_track_primary
+            interface {{ interfacename }}
+            virtual_router_id 111
+            advert_int 3
+            track_script {
+                check-haproxy
+            }
+            virtual_ipaddress {
+                {{ vip }}
+            }
+          }
+          EOF
+      when: names | count > 1
+    - name: Start Keepalived Service
+      systemd: name=keepalived state=started daemon_reload=yes enabled=yes
+      when: names | count > 1
+
+- hosts: k8smaster[0]
+  gather_facts: no
+  remote_user: root
+  vars:
+    hosts: "{{ groups['k8smaster'] | map('extract', hostvars, ['ansible_host']) | list }}"
+    names: "{{ groups['k8smaster'] }}"
+    etcdhosts: "{{ groups['etcd'] | map('extract', hostvars, ['ansible_host']) | list }}"
+  tasks:
+    - name: Generate Kubeadm Config
+      shell:
+        cmd: |
+          cat <<EOF > kubeadm-config.yaml
+          apiVersion: kubeadm.k8s.io/v1beta2
+          certificatesDir: /etc/kubernetes/pki
+          clusterName: kubernetes
+          imageRepository: registry.aliyuncs.com/google_containers
+          kind: ClusterConfiguration
+          kubernetesVersion: v{{ version }}
+          networking:
+            dnsDomain: cluster.local
+            podSubnet: 100.64.0.0/10
+            serviceSubnet: 10.96.0.0/12
+          apiServer:
+            certSANs:
+            - 127.0.0.1
+          {% for host in hosts %}
+            - {{ host }}
+          {% endfor %}
+          {% for name in names %}
+            - {{ name }}
+          {% endfor %}
+          {% if vip is defined %}  - {{ vip }}
+          {% endif %}
+          {% if externalip is defined %}  - {{ externalip }}
+          {% endif %}
+            extraArgs:
+              feature-gates: TTLAfterFinished=true
+            extraVolumes:
+            - hostPath: /etc/localtime
+              mountPath: /etc/localtime
+              name: localtime
+              pathType: File
+              readOnly: true
+            timeoutForControlPlane: 4m0s
+          controlPlaneEndpoint: {% if (vip is defined) and (names | count > 1) %}{{ vip }}:8443
+          {% else %}{{ ansible_host }}:6443
+          {% endif %}
+          controllerManager:
+            extraArgs:
+              experimental-cluster-signing-duration: 876000h
+              feature-gates: TTLAfterFinished=true
+            extraVolumes:
+            - hostPath: /etc/localtime
+              mountPath: /etc/localtime
+              name: localtime
+              pathType: File
+              readOnly: true
+          dns:
+            type: CoreDNS
+          etcd:
+            external:
+              endpoints:
+          {% for etcdhost in etcdhosts %}
+                - https://{{ etcdhost }}:2379
+          {% endfor %}
+              caFile: /etc/etcd/ssl/ca.pem
+              certFile: /etc/etcd/ssl/etcd.pem
+              keyFile: /etc/etcd/ssl/etcd-key.pem
+          scheduler:
+            extraArgs:
+              feature-gates: TTLAfterFinished=true
+            extraVolumes:
+            - hostPath: /etc/localtime
+              mountPath: /etc/localtime
+              name: localtime
+              pathType: File
+              readOnly: true
+          ---
+          apiVersion: kubeproxy.config.k8s.io/v1alpha1
+          kind: KubeProxyConfiguration
+          mode: ipvs
+          EOF
+    - name: Get Cluter Token
+      shell: kubeadm init --config kubeadm-config.yaml | grep -B 2 '\--control-plane' > /root/join.sh
+
+- hosts: k8smaster
+  gather_facts: no
+  vars:
+    ansible_python_interpreter: "/usr/bin/python3"
+    copy_node: "{{ groups['k8smaster'][0] }}"
+  tasks:
+    - name: Copy Join Command
+      synchronize: src=/root/join.sh dest=/root/join.sh
+      delegate_to: "{{ copy_node }}"
+      when: inventory_hostname != copy_node
+    - name: Create PKI Directory
+      file: path=/etc/kubernetes/pki state=directory
+      when: inventory_hostname != copy_node
+    - name: Copy kubeadm PKI Directory
+      synchronize: src=/etc/kubernetes/pki/ dest=/etc/kubernetes/pki/
+      delegate_to: "{{ copy_node }}"
+      when: inventory_hostname != copy_node
+    - name: Change file permissions
+      file:
+        path: /root/join.sh
+        mode: '0755'
+      when: inventory_hostname != copy_node
+    - name: Execute Join command
+      script: /root/join.sh
+      when: inventory_hostname != copy_node
+    - name: Move kubectl cert file
+      command: "{{ item }}"
+      with_items:
+        - rm -f $HOME/.kube/config
+        - mkdir -p $HOME/.kube
+        - cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+        - chown 0:0 $HOME/.kube/config
+    - name: Delete join file
+      file: path=/root/join.sh state=absent
+
+- hosts: k8smaster[0]
+  gather_facts: no
+  tasks:
+    - name: Generate Flannel Network Config
+      shell:
+        cmd: |
+          cat <<EOF > kube-flannel.yml
+          ---
+          apiVersion: policy/v1beta1
+          kind: PodSecurityPolicy
+          metadata:
+            name: psp.flannel.unprivileged
+            annotations:
+              seccomp.security.alpha.kubernetes.io/allowedProfileNames: docker/default
+              seccomp.security.alpha.kubernetes.io/defaultProfileName: docker/default
+              apparmor.security.beta.kubernetes.io/allowedProfileNames: runtime/default
+              apparmor.security.beta.kubernetes.io/defaultProfileName: runtime/default
+          spec:
+            privileged: false
+            volumes:
+              - configMap
+              - secret
+              - emptyDir
+              - hostPath
+            allowedHostPaths:
+              - pathPrefix: "/etc/cni/net.d"
+              - pathPrefix: "/etc/kube-flannel"
+              - pathPrefix: "/run/flannel"
+            readOnlyRootFilesystem: false
+            # Users and groups
+            runAsUser:
+              rule: RunAsAny
+            supplementalGroups:
+              rule: RunAsAny
+            fsGroup:
+              rule: RunAsAny
+            # Privilege Escalation
+            allowPrivilegeEscalation: false
+            defaultAllowPrivilegeEscalation: false
+            # Capabilities
+            allowedCapabilities: ['NET_ADMIN']
+            defaultAddCapabilities: []
+            requiredDropCapabilities: []
+            # Host namespaces
+            hostPID: false
+            hostIPC: false
+            hostNetwork: true
+            hostPorts:
+            - min: 0
+              max: 65535
+            # SELinux
+            seLinux:
+              # SELinux is unused in CaaSP
+              rule: 'RunAsAny'
+          ---
+          kind: ClusterRole
+          apiVersion: rbac.authorization.k8s.io/v1beta1
+          metadata:
+            name: flannel
+          rules:
+            - apiGroups: ['extensions']
+              resources: ['podsecuritypolicies']
+              verbs: ['use']
+              resourceNames: ['psp.flannel.unprivileged']
+            - apiGroups:
+                - ""
+              resources:
+                - pods
+              verbs:
+                - get
+            - apiGroups:
+                - ""
+              resources:
+                - nodes
+              verbs:
+                - list
+                - watch
+            - apiGroups:
+                - ""
+              resources:
+                - nodes/status
+              verbs:
+                - patch
+          ---
+          kind: ClusterRoleBinding
+          apiVersion: rbac.authorization.k8s.io/v1beta1
+          metadata:
+            name: flannel
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: flannel
+          subjects:
+          - kind: ServiceAccount
+            name: flannel
+            namespace: kube-system
+          ---
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: flannel
+            namespace: kube-system
+          ---
+          kind: ConfigMap
+          apiVersion: v1
+          metadata:
+            name: kube-flannel-cfg
+            namespace: kube-system
+            labels:
+              tier: node
+              app: flannel
+          data:
+            cni-conf.json: |
+              {
+                "name": "cbr0",
+                "cniVersion": "0.3.1",
+                "plugins": [
+                  {
+                    "type": "flannel",
+                    "delegate": {
+                      "hairpinMode": true,
+                      "isDefaultGateway": true
+                    }
+                  },
+                  {
+                    "type": "portmap",
+                    "capabilities": {
+                      "portMappings": true
+                    }
+                  }
+                ]
+              }
+            net-conf.json: |
+              {
+                "Network": "100.64.0.0/10",
+                "Backend": {
+                  "Type": "vxlan",
+                  "DirectRouting": true
+                }
+              }
+          ---
+          apiVersion: apps/v1
+          kind: DaemonSet
+          metadata:
+            name: kube-flannel-ds-amd64
+            namespace: kube-system
+            labels:
+              tier: node
+              app: flannel
+          spec:
+            selector:
+              matchLabels:
+                app: flannel
+            template:
+              metadata:
+                labels:
+                  tier: node
+                  app: flannel
+              spec:
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                        - matchExpressions:
+                            - key: kubernetes.io/os
+                              operator: In
+                              values:
+                                - linux
+                            - key: kubernetes.io/arch
+                              operator: In
+                              values:
+                                - amd64
+                hostNetwork: true
+                tolerations:
+                - operator: Exists
+                  effect: NoSchedule
+                serviceAccountName: flannel
+                initContainers:
+                - name: install-cni
+                  image: quay.io/coreos/flannel:v0.12.0-amd64
+                  command:
+                  - cp
+                  args:
+                  - -f
+                  - /etc/kube-flannel/cni-conf.json
+                  - /etc/cni/net.d/10-flannel.conflist
+                  volumeMounts:
+                  - name: cni
+                    mountPath: /etc/cni/net.d
+                  - name: flannel-cfg
+                    mountPath: /etc/kube-flannel/
+                containers:
+                - name: kube-flannel
+                  image: quay.io/coreos/flannel:v0.12.0-amd64
+                  command:
+                  - /opt/bin/flanneld
+                  args:
+                  - --ip-masq
+                  - --kube-subnet-mgr
+                  - --iface={{ interfacename }}
+                  resources:
+                    requests:
+                      cpu: "100m"
+                      memory: "50Mi"
+                    limits:
+                      cpu: "100m"
+                      memory: "50Mi"
+                  securityContext:
+                    privileged: false
+                    capabilities:
+                      add: ["NET_ADMIN"]
+                  env:
+                  - name: POD_NAME
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.name
+                  - name: POD_NAMESPACE
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.namespace
+                  volumeMounts:
+                  - name: run
+                    mountPath: /run/flannel
+                  - name: flannel-cfg
+                    mountPath: /etc/kube-flannel/
+                volumes:
+                  - name: run
+                    hostPath:
+                      path: /run/flannel
+                  - name: cni
+                    hostPath:
+                      path: /etc/cni/net.d
+                  - name: flannel-cfg
+                    configMap:
+                      name: kube-flannel-cfg
+          EOF
+    - name: Setup Flannel Network Plugin
+      command: kubectl apply -f kube-flannel.yml
+    - name: Generate Metrics Server Config
+      shell:
+        cmd: |
+          cat <<EOF > metrics.yml
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: system:aggregated-metrics-reader
+            labels:
+              rbac.authorization.k8s.io/aggregate-to-view: "true"
+              rbac.authorization.k8s.io/aggregate-to-edit: "true"
+              rbac.authorization.k8s.io/aggregate-to-admin: "true"
+          rules:
+          - apiGroups: ["metrics.k8s.io"]
+            resources: ["pods", "nodes"]
+            verbs: ["get", "list", "watch"]
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: metrics-server:system:auth-delegator
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: system:auth-delegator
+          subjects:
+          - kind: ServiceAccount
+            name: metrics-server
+            namespace: kube-system
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: metrics-server-auth-reader
+            namespace: kube-system
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: Role
+            name: extension-apiserver-authentication-reader
+          subjects:
+          - kind: ServiceAccount
+            name: metrics-server
+            namespace: kube-system
+          ---
+          apiVersion: apiregistration.k8s.io/v1beta1
+          kind: APIService
+          metadata:
+            name: v1beta1.metrics.k8s.io
+          spec:
+            service:
+              name: metrics-server
+              namespace: kube-system
+            group: metrics.k8s.io
+            version: v1beta1
+            insecureSkipTLSVerify: true
+            groupPriorityMinimum: 100
+            versionPriority: 100
+          ---
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: metrics-server
+            namespace: kube-system
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: metrics-server
+            namespace: kube-system
+            labels:
+              k8s-app: metrics-server
+          spec:
+            selector:
+              matchLabels:
+                k8s-app: metrics-server
+            template:
+              metadata:
+                name: metrics-server
+                labels:
+                  k8s-app: metrics-server
+              spec:
+                serviceAccountName: metrics-server
+                tolerations:
+                - operator: Exists
+                  effect: NoSchedule
+                volumes:
+                # mount in tmp so we can safely use from-scratch images and/or read-only containers
+                - name: tmp-dir
+                  emptyDir: {}
+                containers:
+                - name: metrics-server
+                  image: registry.aliyuncs.com/google_containers/metrics-server-amd64:v0.3.6
+                  imagePullPolicy: IfNotPresent
+                  args:
+                    - --cert-dir=/tmp
+                    - --secure-port=4443
+                    - --kubelet-insecure-tls
+                    - --kubelet-preferred-address-types=InternalIP
+                  ports:
+                  - name: main-port
+                    containerPort: 4443
+                    protocol: TCP
+                  securityContext:
+                    readOnlyRootFilesystem: true
+                    runAsNonRoot: true
+                    runAsUser: 1000
+                  volumeMounts:
+                  - name: tmp-dir
+                    mountPath: /tmp
+                nodeSelector:
+                  kubernetes.io/os: linux
+                  kubernetes.io/arch: "amd64"
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: metrics-server
+            namespace: kube-system
+            labels:
+              kubernetes.io/name: "Metrics-server"
+              kubernetes.io/cluster-service: "true"
+          spec:
+            selector:
+              k8s-app: metrics-server
+            ports:
+            - port: 443
+              protocol: TCP
+              targetPort: main-port
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: system:metrics-server
+          rules:
+          - apiGroups:
+            - ""
+            resources:
+            - pods
+            - nodes
+            - nodes/stats
+            - namespaces
+            - configmaps
+            verbs:
+            - get
+            - list
+            - watch
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: system:metrics-server
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: system:metrics-server
+          subjects:
+          - kind: ServiceAccount
+            name: metrics-server
+            namespace: kube-system
+          EOF
+    - name: Setup Metrics Server
+      command: kubectl apply -f metrics.yml
+    - name: remove temp file
+      file: "path={{ item }} state=absent"
+      with_items:
+        - kubeadm-config.yaml
+        - kube-flannel.yml
+        - metrics.yml
+
+- hosts: k8smaster[0]
+  gather_facts: no
+  tasks:
+    - name: Create k8s join token
+      shell: kubeadm token create --print-join-command > /root/join.sh
+
+- hosts: k8snode
+  gather_facts: no
+  vars:
+    ansible_python_interpreter: "/usr/bin/python3"
+    copy_node: "{{ groups['k8smaster'][0] }}"
+  tasks:
+    - name: Copy Join Command
+      synchronize: src=/root/join.sh dest=/root/join.sh
+      delegate_to: "{{ copy_node }}"
+    - name: Change file permissions
+      file:
+        path: /root/join.sh
+        mode: '0755'
+    - name: Execute Join command
+      script: /root/join.sh
+    - name: Delete join file
+      file: path=/root/join.sh state=absent
+
+- hosts: k8smaster[0]
+  gather_facts: no
+  tasks:
+    - name: Delete join file
+      file: path=/root/join.sh state=absent

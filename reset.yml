@@ -1,0 +1,51 @@
+- hosts: all
+  gather_facts: no
+  remote_user: root
+  tasks:
+    - name: Reset kubeadm
+      command: "{{ item }}"
+      with_items:
+        - kubeadm reset -f
+        - ipvsadm -C
+    - name: Stop docker & kubelet service
+      service: "name={{ item }} state=stopped enabled=no"
+      with_items:
+        - docker
+        - kubelet
+    - name: Flush kubelet volume
+      file: path=/var/lib/kubelet/pods state=absent
+    - name: Flush docker volume
+      file: path=/var/lib/docker state=absent
+    - name: Flush cni volume
+      file: path=/etc/cni/net.d state=absent
+    - name: Flush flannel network interface
+      shell: "ip link del {{ item }} || true"
+      with_items:
+        - cni0
+        - flannel.1
+
+- hosts: k8smaster
+  gather_facts: no
+  remote_user: root
+  tasks:
+    - name: stop keepalived & haproxy service
+      service: "name={{ item }} state=stopped enabled=no"
+      with_items:
+        - keepalived
+        - haproxy
+    - name: Remove k8s files
+      file: path=/etc/kubernetes/* state=absent
+    - name: Remove keepalived files
+      file: path=/etc/keepalived/keepalived.conf state=absent
+    - name: Remove haproxy files
+      file: path=/etc/haproxy/haproxy.conf state=absent
+- hosts: etcd
+  gather_facts: no
+  remote_user: root
+  tasks:
+    - name: Stop etcd service
+      service: name=etcd state=stopped enabled=no
+    - name: Remove etcd files
+      file: path=/var/lib/etcd/ state=absent
+    - name: Remove etcd certificates
+      file: path=/etc/etcd/ssl/ state=absent
