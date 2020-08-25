@@ -80,6 +80,7 @@
           - psmisc
           - systemd
           - rsync
+          - python3
           - yum-utils
           - device-mapper-persistent-data
           - lvm2
